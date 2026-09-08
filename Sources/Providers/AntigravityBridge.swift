@@ -188,6 +188,7 @@ enum AntigravityBridge {
         struct Bucket: Decodable {
             let bucketId: String?
             let displayName: String?
+            let window: String?
             let remainingFraction: Double?
             let resetTime: String?
         }
@@ -216,17 +217,44 @@ enum AntigravityBridge {
             else { return nil }
             return LimitWindow(
                 id: bucket.bucketId ?? group?.displayName ?? bucket.displayName ?? "quota",
-                // The group names the models; the bucket only ever says
-                // "Weekly Limit Remaining", which is the same for both.
-                label: group?.displayName ?? bucket.displayName ?? "Usage",
+                // A group's two buckets differ only by window, so the window
+                // is the label — the words Codex uses for the same two rows.
+                // The group name is what the ring is already called.
+                label: windowOrder.first { $0.code == bucket.window }?.label
+                    ?? group?.displayName ?? bucket.displayName ?? "Usage",
                 usedFraction: 1 - remaining,
                 resetsAt: bucket.resetTime.flatMap(AntigravityCredentials.parse)
             )
         }
 
-        return groups.flatMap { group in (group.buckets ?? []).compactMap { window($0, group: group) } }
-            + loose.compactMap { window($0, group: nil) }
+        func isResold(_ bucket: Bucket) -> Bool {
+            bucket.bucketId?.hasPrefix(resoldPoolPrefix) == true
+        }
+
+        // Short window first, as Codex lists its own; Google sends weekly
+        // first. A bucket with a window this table does not know keeps the
+        // server's place after them.
+        func ordered(_ buckets: [Bucket]) -> [Bucket] {
+            windowOrder.flatMap { row in buckets.filter { $0.window == row.code } }
+                + buckets.filter { bucket in !windowOrder.contains { $0.code == bucket.window } }
+        }
+
+        return groups.flatMap { group in
+            ordered((group.buckets ?? []).filter { !isResold($0) }).compactMap { window($0, group: group) }
+        } + ordered(loose.filter { !isResold($0) }).compactMap { window($0, group: nil) }
     }
+
+    /// Google's `window` codes, in the order the tooltip lists them.
+    private static let windowOrder: [(code: String, label: String)] = [
+        ("5h", "5h limit"),
+        ("weekly", "Weekly limit"),
+    ]
+
+    /// Bucket ids of the pool Antigravity keeps for the Claude and GPT models
+    /// it resells: `3p-weekly`, `3p-5h`. The Claude and Codex rings read those
+    /// accounts directly, so a second copy here — always full, since nobody
+    /// uses them through Antigravity — is noise, not a reading.
+    private static let resoldPoolPrefix = "3p-"
 
     // MARK: - Plumbing
 

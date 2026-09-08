@@ -201,7 +201,7 @@ final class AntigravityQuotaTests: XCTestCase {
         let windows = AntigravityBridge.windows(in: body)
         XCTAssertEqual(windows.count, 1)
         XCTAssertEqual(windows.first?.usedFraction ?? 0, 0.25, accuracy: 0.0001)
-        XCTAssertEqual(windows.first?.label, "Gemini Models")
+        XCTAssertEqual(windows.first?.label, "Weekly limit")
         XCTAssertEqual(windows.first?.id, "gemini-weekly")
     }
 
@@ -285,7 +285,10 @@ final class AntigravityBridgeTests: XCTestCase {
        "description":"Models within this group: Gemini Flash, Gemini Pro",
        "buckets":[{"bucketId":"gemini-weekly","displayName":"Weekly Limit Remaining",
                    "window":"weekly","remainingFraction":0.96262,
-                   "resetTime":"2026-09-07T14:12:34Z"}]},
+                   "resetTime":"2026-09-07T14:12:34Z"},
+                  {"bucketId":"gemini-5h","displayName":"Five Hour Limit Remaining",
+                   "window":"5h","remainingFraction":1,
+                   "resetTime":"2026-09-08T10:12:10Z"}]},
       {"displayName":"Claude and GPT models",
        "buckets":[{"bucketId":"3p-weekly","displayName":"Weekly Limit Remaining",
                    "window":"weekly","remainingFraction":1,
@@ -296,20 +299,36 @@ final class AntigravityBridgeTests: XCTestCase {
     /// Inverting it here rather than in the view keeps a percentage meaning the
     /// same thing whichever provider produced it.
     func testRemainingIsTurnedIntoUsed() {
-        let windows = AntigravityBridge.windows(in: real)
-        XCTAssertEqual(windows.count, 2)
-        XCTAssertEqual(windows[0].id, "gemini-weekly")
-        XCTAssertEqual(windows[0].usedFraction ?? 0, 1 - 0.96262, accuracy: 0.00001)
-        XCTAssertEqual(windows[0].label, "Gemini Models")
+        let weekly = AntigravityBridge.windows(in: real).first { $0.id == "gemini-weekly" }
+        XCTAssertEqual(weekly?.usedFraction ?? 0, 1 - 0.96262, accuracy: 0.00001)
     }
 
     /// A full bucket is 0% used, not "no reading".
     func testAnUntouchedLimitIsZeroUsed() {
-        XCTAssertEqual(AntigravityBridge.windows(in: real)[1].usedFraction, 0)
+        XCTAssertEqual(AntigravityBridge.windows(in: real).first { $0.id == "gemini-5h" }?.usedFraction, 0)
+    }
+
+    /// Two rows of one group differ only by window, so the window is the
+    /// label — and in Codex's words, so the two tooltips read alike.
+    func testRowsAreNamedByWindowLikeCodex() {
+        XCTAssertEqual(AntigravityBridge.windows(in: real).map(\.label), ["5h limit", "Weekly limit"])
+    }
+
+    /// Google sends weekly first; the tooltip lists the short window first,
+    /// as Codex does.
+    func testTheShortWindowComesFirst() {
+        XCTAssertEqual(AntigravityBridge.windows(in: real).map(\.id), ["gemini-5h", "gemini-weekly"])
+    }
+
+    /// The Claude and GPT pool Antigravity resells is not a reading here:
+    /// those accounts have rings of their own.
+    func testTheResoldClaudeAndGPTPoolIsDropped() {
+        XCTAssertFalse(AntigravityBridge.windows(in: real).contains { $0.id.hasPrefix("3p-") })
     }
 
     func testItKeepsTheResetTime() throws {
-        let resets = try XCTUnwrap(AntigravityBridge.windows(in: real)[0].resetsAt)
+        let weekly = AntigravityBridge.windows(in: real).first { $0.id == "gemini-weekly" }
+        let resets = try XCTUnwrap(weekly?.resetsAt)
         XCTAssertEqual(resets, ISO8601DateFormatter().date(from: "2026-09-07T14:12:34Z"))
     }
 

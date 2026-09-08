@@ -128,8 +128,11 @@ actor AntigravityProvider: UsageProvider {
 
         // Then Google directly, which answers for a licensed account.
         if let windows = try await quota(token: credentials.accessToken), !windows.isEmpty {
+            // Same headline as the bridged path: the ring means the same
+            // thing whichever route answered.
             return ProviderSnapshot(id: id, displayName: displayName, glyph: glyph,
-                                    fidelity: .official, status: .ok, windows: windows)
+                                    fidelity: .official, status: .ok, windows: windows,
+                                    headlineID: "gemini-weekly")
         }
 
         // Not licensed, so Google will not say how much of what. Our own count
