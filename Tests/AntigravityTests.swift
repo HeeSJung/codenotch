@@ -341,7 +341,7 @@ final class AntigravityBridgeTests: XCTestCase {
             })
         )
         XCTAssertEqual(endpoint.csrfToken, "d4bd9204-bf02-4111-b1fe-71f0d0d921d0")
-        XCTAssertEqual(endpoint.ports, [63881, 63882])
+        XCTAssertEqual(endpoint.baseURLs.map(\.port), [63881, 63882])
     }
 
     func testNoAntigravityMeansNoEndpoint() {
@@ -363,7 +363,6 @@ final class AntigravityBridgeTests: XCTestCase {
         let endpoint = AntigravityBridge.Endpoint(ports: [63881, 63882], csrfToken: "t")
         XCTAssertEqual(endpoint.baseURLs.map(\.absoluteString),
                        ["https://127.0.0.1:63881", "https://127.0.0.1:63882"])
-        XCTAssertEqual(endpoint.ports, [63881, 63882])
         XCTAssertEqual(endpoint.csrfToken, "t")
     }
 
@@ -372,7 +371,6 @@ final class AntigravityBridgeTests: XCTestCase {
     func testARemoteEndpointIsOneAddressAndNoToken() {
         let endpoint = AntigravityBridge.Endpoint(remote: URL(string: "http://100.77.193.57:7910")!)
         XCTAssertEqual(endpoint.baseURLs.map(\.absoluteString), ["http://100.77.193.57:7910"])
-        XCTAssertEqual(endpoint.ports, [7910])
         XCTAssertNil(endpoint.csrfToken)
     }
 

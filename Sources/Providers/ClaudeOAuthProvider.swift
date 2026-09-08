@@ -260,8 +260,9 @@ struct UsageResponse: Decodable {
         let model: Model?
         let surface: String?
 
-        /// What the window is scoped to, worded as the endpoint words it —
-        /// "Fable" for a per-model window, the surface otherwise.
+        /// What the window is scoped to: the model's display name as the
+        /// endpoint words it ("Fable"), else the surface, capitalised because
+        /// the endpoint sends it lowercase and it sits beside a proper noun.
         var name: String? {
             if let name = model?.displayName, !name.isEmpty { return name }
             if let surface, !surface.isEmpty { return surface.capitalized }

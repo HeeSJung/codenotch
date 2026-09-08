@@ -34,7 +34,8 @@ actor AntigravityProvider: UsageProvider {
     /// is not something to do every minute. Cached until it stops working.
     private var bridge: AntigravityBridge.Endpoint?
     /// A bridge the user pointed at by hand — a relay in front of an `agy`
-    /// running elsewhere. Fixed, so never discovered and never forgotten.
+    /// running elsewhere. Fixed, so never discovered and never forgotten;
+    /// asked first, with the local server still tried when it does not answer.
     private let remote: AntigravityBridge.Endpoint?
     /// Whether the language server has ever answered.
     ///
@@ -162,9 +163,13 @@ actor AntigravityProvider: UsageProvider {
     /// closed is the ordinary case, not a fault, and the caller has an honest
     /// answer to fall back to.
     private func localQuota() async -> [LimitWindow]? {
-        if let remote {
-            return try? await AntigravityBridge.quota(from: remote, session: localSession)
+        if let remote, let windows = try? await AntigravityBridge.quota(
+            from: remote, session: localSession
+        ), !windows.isEmpty {
+            return windows
         }
+        // A relay that is down is not a reason to ignore an Antigravity
+        // running right here.
         if let bridge, let windows = try? await AntigravityBridge.quota(
             from: bridge, session: localSession
         ), !windows.isEmpty {

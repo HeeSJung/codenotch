@@ -41,8 +41,6 @@ enum AntigravityBridge {
             baseURLs = [remote]
             csrfToken = nil
         }
-
-        var ports: [Int] { baseURLs.compactMap(\.port) }
     }
 
     /// The remote bridge the user configured, if any.
