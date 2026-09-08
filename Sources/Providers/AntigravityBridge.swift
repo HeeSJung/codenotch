@@ -18,11 +18,54 @@ import os
 enum AntigravityBridge {
     /// Where the language server is listening, and the token it demands.
     struct Endpoint: Equatable {
-        /// Every port the server listens on. It opens two and only one serves
-        /// this RPC, and which is which is not advertised — so both are tried
-        /// rather than guessed at.
-        let ports: [Int]
-        let csrfToken: String
+        /// Every base the RPC might answer at, tried in order. A local server
+        /// opens two ports and only one serves this RPC, and which is which is
+        /// not advertised — so both are tried rather than guessed at. A relay
+        /// is one address that already did the choosing.
+        let baseURLs: [URL]
+        /// Only the IDE's language server demands one. The `agy` CLI's server
+        /// takes none, and neither does a relay in front of it.
+        let csrfToken: String?
+
+        /// The language server on this machine, found in the process table.
+        init(ports: [Int], csrfToken: String) {
+            baseURLs = ports.map { URL(string: "https://127.0.0.1:\($0)")! }
+            self.csrfToken = csrfToken
+        }
+
+        /// A server somewhere else — typically a relay on a private network
+        /// standing in front of an `agy` running on another machine, so this
+        /// Mac can draw the ring for work that happens there. Nothing to
+        /// discover: the address is fixed and so is the (absent) token.
+        init(remote: URL) {
+            baseURLs = [remote]
+            csrfToken = nil
+        }
+
+        var ports: [Int] { baseURLs.compactMap(\.port) }
+    }
+
+    /// The remote bridge the user configured, if any.
+    ///
+    /// Read from the environment first (`CODENOTCH_ANTIGRAVITY_URL`, for a
+    /// launch from a shell) and then from defaults (`antigravityBridgeURL`,
+    /// which is what a Finder launch sees — `defaults write com.vinz.codenotch
+    /// antigravityBridgeURL http://host:port`). There is no settings field for
+    /// it on purpose: it is a one-time plumbing choice, not something to reach
+    /// for daily, and a text field would invite pasting a public address into
+    /// an unauthenticated RPC.
+    static func configuredRemote(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        defaults: UserDefaults = .standard
+    ) -> URL? {
+        let raw = environment["CODENOTCH_ANTIGRAVITY_URL"]
+            ?? defaults.string(forKey: "antigravityBridgeURL")
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty,
+              let url = URL(string: raw),
+              let scheme = url.scheme, scheme == "http" || scheme == "https",
+              let host = url.host, !host.isEmpty
+        else { return nil }
+        return url
     }
 
     /// Antigravity is built on Codeium's stack, and the header still says so.
@@ -87,9 +130,9 @@ enum AntigravityBridge {
 
     static func quota(from endpoint: Endpoint, session: URLSession) async throws -> [LimitWindow] {
         var lastError: Error?
-        for port in endpoint.ports {
+        for base in endpoint.baseURLs {
             do {
-                let windows = try await quota(port: port, token: endpoint.csrfToken,
+                let windows = try await quota(base: base, token: endpoint.csrfToken,
                                               session: session)
                 if !windows.isEmpty { return windows }
             } catch {
@@ -100,14 +143,17 @@ enum AntigravityBridge {
         return []
     }
 
-    private static func quota(port: Int, token: String,
+    private static func quota(base: URL, token: String?,
                               session: URLSession) async throws -> [LimitWindow] {
-        var request = URLRequest(
-            url: URL(string: "https://127.0.0.1:\(port)\(service)")!
-        )
+        // String-joined rather than `appendingPathComponent`, which would
+        // percent-encode nothing here but does re-slash: `service` already
+        // begins with `/`, and the base is host-and-port.
+        var base = base.absoluteString
+        while base.hasSuffix("/") { base.removeLast() }
+        var request = URLRequest(url: URL(string: base + service)!)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(token, forHTTPHeaderField: csrfHeader)
+        if let token { request.setValue(token, forHTTPHeaderField: csrfHeader) }
         // `forceRefresh` is why this reads as live rather than as whatever was
         // last looked at. The language server keeps a `QuotaSummaryCache`, and
         // an empty request is served from it — so the figure only moved when
@@ -132,41 +178,56 @@ enum AntigravityBridge {
     /// The server reports what is **left**, not what is spent — the notch shows
     /// the opposite, so every fraction is inverted here rather than in the view,
     /// where it would be a percentage whose meaning depended on the provider.
+    ///
+    /// Two envelopes, one message. The language server wraps
+    /// `RetrieveUserQuotaSummaryResponse` in `response`; Google's own
+    /// `v1internal:retrieveUserQuotaSummary` answers with the bare message —
+    /// `groups[]`, and `buckets[]` for a bucket in no group. The field names
+    /// come from the message descriptors in Antigravity's binary
+    /// (`QuotaSummaryGroup`, `QuotaSummaryBucket`), and the wrapped form was
+    /// read back verbatim from a running server.
     static func windows(in data: Data) -> [LimitWindow] {
-        struct Response: Decodable {
-            struct Bucket: Decodable {
-                let bucketId: String?
-                let displayName: String?
-                let remainingFraction: Double?
-                let resetTime: String?
-            }
-            struct Group: Decodable {
-                let displayName: String?
-                let buckets: [Bucket]?
-            }
-            struct Body: Decodable { let groups: [Group]? }
-            let response: Body?
+        struct Bucket: Decodable {
+            let bucketId: String?
+            let displayName: String?
+            let remainingFraction: Double?
+            let resetTime: String?
+        }
+        struct Group: Decodable {
+            let displayName: String?
+            let buckets: [Bucket]?
+        }
+        struct Summary: Decodable {
+            let groups: [Group]?
+            let buckets: [Bucket]?
+        }
+        struct Envelope: Decodable {
+            let response: Summary?
+            let groups: [Group]?
+            let buckets: [Bucket]?
         }
 
-        guard let decoded = try? JSONDecoder().decode(Response.self, from: data),
-              let groups = decoded.response?.groups
+        guard let decoded = try? JSONDecoder().decode(Envelope.self, from: data)
         else { return [] }
+        let groups = decoded.response?.groups ?? decoded.groups ?? []
+        let loose = decoded.response?.buckets ?? decoded.buckets ?? []
 
-        return groups.flatMap { group -> [LimitWindow] in
-            (group.buckets ?? []).compactMap { bucket in
-                guard let remaining = bucket.remainingFraction,
-                      remaining >= 0, remaining <= 1
-                else { return nil }
-                return LimitWindow(
-                    id: bucket.bucketId ?? group.displayName ?? "quota",
-                    // The group names the models; the bucket only ever says
-                    // "Weekly Limit Remaining", which is the same for both.
-                    label: group.displayName ?? bucket.displayName ?? "Usage",
-                    usedFraction: 1 - remaining,
-                    resetsAt: bucket.resetTime.flatMap(AntigravityCredentials.parse)
-                )
-            }
+        func window(_ bucket: Bucket, group: Group?) -> LimitWindow? {
+            guard let remaining = bucket.remainingFraction,
+                  remaining >= 0, remaining <= 1
+            else { return nil }
+            return LimitWindow(
+                id: bucket.bucketId ?? group?.displayName ?? bucket.displayName ?? "quota",
+                // The group names the models; the bucket only ever says
+                // "Weekly Limit Remaining", which is the same for both.
+                label: group?.displayName ?? bucket.displayName ?? "Usage",
+                usedFraction: 1 - remaining,
+                resetsAt: bucket.resetTime.flatMap(AntigravityCredentials.parse)
+            )
         }
+
+        return groups.flatMap { group in (group.buckets ?? []).compactMap { window($0, group: group) } }
+            + loose.compactMap { window($0, group: nil) }
     }
 
     // MARK: - Plumbing

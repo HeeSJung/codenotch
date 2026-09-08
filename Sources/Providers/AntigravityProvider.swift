@@ -33,6 +33,9 @@ actor AntigravityProvider: UsageProvider {
     /// Re-discovering the port and token means spawning `ps` and `lsof`, which
     /// is not something to do every minute. Cached until it stops working.
     private var bridge: AntigravityBridge.Endpoint?
+    /// A bridge the user pointed at by hand — a relay in front of an `agy`
+    /// running elsewhere. Fixed, so never discovered and never forgotten.
+    private let remote: AntigravityBridge.Endpoint?
     /// Whether the language server has ever answered.
     ///
     /// Once it has, a failure is Antigravity being closed or restarted — its
@@ -42,11 +45,16 @@ actor AntigravityProvider: UsageProvider {
     /// rather than degraded.
     private var everBridged = false
 
-    init(session: URLSession = .shared) {
+    init(session: URLSession = .shared,
+         remote: URL? = AntigravityBridge.configuredRemote()) {
         self.session = session
+        // The same session serves a remote bridge: `LocalhostTrust` only
+        // vouches for loopback, so a remote HTTPS address is held to the
+        // system's trust and a plain HTTP one never asks.
         self.localSession = URLSession(configuration: .ephemeral,
                                        delegate: LocalhostTrust(),
                                        delegateQueue: nil)
+        self.remote = remote.map { AntigravityBridge.Endpoint(remote: $0) }
     }
 
     nonisolated var signInRoute: SignInRoute {
@@ -154,6 +162,9 @@ actor AntigravityProvider: UsageProvider {
     /// closed is the ordinary case, not a fault, and the caller has an honest
     /// answer to fall back to.
     private func localQuota() async -> [LimitWindow]? {
+        if let remote {
+            return try? await AntigravityBridge.quota(from: remote, session: localSession)
+        }
         if let bridge, let windows = try? await AntigravityBridge.quota(
             from: bridge, session: localSession
         ), !windows.isEmpty {
@@ -187,48 +198,11 @@ actor AntigravityProvider: UsageProvider {
 
         let (data, response) = try await session.data(for: request)
         guard (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
-        return Self.windows(in: data)
-    }
-
-    /// Turns a quota summary into limit windows.
-    ///
-    /// Written from the message names in Antigravity's own binary
-    /// (`QuotaSummaryGroup`, `QuotaSummaryBucket`, `QuotaLimit`) because no
-    /// licensed account was available to answer with a real body. So it is
-    /// deliberately suspicious of itself: anything without a positive limit, or
-    /// claiming more used than the limit allows, is dropped rather than shown.
-    /// An empty result sends the caller to the honest fallback, which is the
-    /// right outcome for a shape that turns out to differ.
-    static func windows(in data: Data) -> [LimitWindow] {
-        struct Response: Decodable {
-            struct Bucket: Decodable {
-                let name: String?
-                let displayName: String?
-                let used: Double?
-                let limit: Double?
-                let resetTime: String?
-            }
-            struct Group: Decodable {
-                let displayName: String?
-                let buckets: [Bucket]?
-            }
-            let quotaGroups: [Group]?
-            let buckets: [Bucket]?
-        }
-
-        guard let decoded = try? JSONDecoder().decode(Response.self, from: data) else { return [] }
-        let buckets = (decoded.quotaGroups?.flatMap { $0.buckets ?? [] } ?? []) + (decoded.buckets ?? [])
-
-        return buckets.compactMap { bucket in
-            guard let limit = bucket.limit, limit > 0,
-                  let used = bucket.used, used >= 0, used <= limit * 1.5
-            else { return nil }
-            let label = bucket.displayName ?? bucket.name ?? "Usage"
-            return LimitWindow(id: bucket.name ?? label,
-                               label: label,
-                               usedFraction: used / limit,
-                               resetsAt: bucket.resetTime.flatMap(AntigravityCredentials.parse))
-        }
+        // Google answers with the bare `RetrieveUserQuotaSummaryResponse`; the
+        // language server wraps the same message. One decoder reads both — a
+        // second one here, written from guessed field names (`used`/`limit`)
+        // before any real body had been seen, returned nothing on a 200.
+        return AntigravityBridge.windows(in: data)
     }
 
     /// The plan's display name, for the message the cell shows.

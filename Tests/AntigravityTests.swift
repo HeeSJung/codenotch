@@ -187,49 +187,51 @@ final class AntigravityActivityTests: XCTestCase {
     }
 }
 
-/// The quota parser is written from message names in Antigravity's binary, not
-/// from a response — no licensed account was available to produce one. So what
-/// is tested is mostly its refusal to believe things: a shape it does not
-/// recognise must yield nothing and send the provider to the honest fallback,
-/// never a confident ring built on a guess.
+/// Google's own quota endpoint answers with the bare
+/// `RetrieveUserQuotaSummaryResponse` — the message the language server wraps
+/// in `response`. One decoder reads both; these pin the bare envelope and the
+/// refusals that keep a guessed shape from becoming a confident ring.
 final class AntigravityQuotaTests: XCTestCase {
-    func testItReadsBucketsIntoWindows() {
+    func testItReadsTheBareEnvelopeGoogleAnswersWith() {
         let body = Data("""
-        {"quotaGroups":[{"displayName":"Gemini","buckets":[
-          {"name":"daily","displayName":"Daily","used":250,"limit":1000,
-           "resetTime":"2026-09-01T00:00:00Z"}]}]}
+        {"groups":[{"displayName":"Gemini Models","buckets":[
+          {"bucketId":"gemini-weekly","displayName":"Weekly Limit Remaining",
+           "window":"weekly","remainingFraction":0.75,"resetTime":"2026-09-01T00:00:00Z"}]}]}
         """.utf8)
-        let windows = AntigravityProvider.windows(in: body)
+        let windows = AntigravityBridge.windows(in: body)
         XCTAssertEqual(windows.count, 1)
         XCTAssertEqual(windows.first?.usedFraction ?? 0, 0.25, accuracy: 0.0001)
+        XCTAssertEqual(windows.first?.label, "Gemini Models")
+        XCTAssertEqual(windows.first?.id, "gemini-weekly")
+    }
+
+    /// `buckets[]` beside `groups[]` is a bucket in no group; it is still a
+    /// reading, labelled by what it says of itself.
+    func testABucketOutsideAnyGroupIsStillARing() {
+        let body = Data(#"{"buckets":[{"bucketId":"x","displayName":"Daily","remainingFraction":0.5}]}"#.utf8)
+        let windows = AntigravityBridge.windows(in: body)
+        XCTAssertEqual(windows.count, 1)
         XCTAssertEqual(windows.first?.label, "Daily")
+        XCTAssertEqual(windows.first?.usedFraction, 0.5)
     }
 
-    /// Cursor's free plan reports an included limit of zero, and dividing by it
-    /// produced a confident 0% for an account well into its month. Nothing with
-    /// a zero limit is ever a percentage.
-    func testAZeroLimitIsDroppedRatherThanDividedBy() {
-        let body = Data(#"{"buckets":[{"name":"x","used":0,"limit":0}]}"#.utf8)
-        XCTAssertTrue(AntigravityProvider.windows(in: body).isEmpty)
-    }
-
-    func testNonsenseValuesAreDropped() {
-        let wild = Data(#"{"buckets":[{"name":"x","used":9999,"limit":10}]}"#.utf8)
-        XCTAssertTrue(AntigravityProvider.windows(in: wild).isEmpty)
-        let negative = Data(#"{"buckets":[{"name":"x","used":-5,"limit":10}]}"#.utf8)
-        XCTAssertTrue(AntigravityProvider.windows(in: negative).isEmpty)
+    /// The shape the decoder used to expect, `used`/`limit`, was never what
+    /// either server sends. It must read as nothing, not as a ring.
+    func testTheGuessedUsedAndLimitShapeYieldsNothing() {
+        let body = Data(#"{"quotaGroups":[{"displayName":"Gemini","buckets":[{"name":"daily","used":250,"limit":1000}]}]}"#.utf8)
+        XCTAssertTrue(AntigravityBridge.windows(in: body).isEmpty)
     }
 
     /// The likeliest future: Google answers with a shape this does not know.
     /// Empty is the correct outcome — it routes to the fallback message.
     func testAnUnfamiliarShapeYieldsNothing() {
-        XCTAssertTrue(AntigravityProvider.windows(in: Data(#"{"somethingElse":[1,2]}"#.utf8)).isEmpty)
-        XCTAssertTrue(AntigravityProvider.windows(in: Data("not json".utf8)).isEmpty)
+        XCTAssertTrue(AntigravityBridge.windows(in: Data(#"{"somethingElse":[1,2]}"#.utf8)).isEmpty)
+        XCTAssertTrue(AntigravityBridge.windows(in: Data("not json".utf8)).isEmpty)
     }
 
     func testAMissingResetIsToleratedRatherThanFatal() {
-        let body = Data(#"{"buckets":[{"name":"d","used":1,"limit":4}]}"#.utf8)
-        XCTAssertEqual(AntigravityProvider.windows(in: body).count, 1)
+        let body = Data(#"{"groups":[{"displayName":"G","buckets":[{"bucketId":"d","remainingFraction":0.2}]}]}"#.utf8)
+        XCTAssertEqual(AntigravityBridge.windows(in: body).count, 1)
     }
 }
 
@@ -351,6 +353,59 @@ final class AntigravityBridgeTests: XCTestCase {
     func testNoPortMeansNoEndpoint() {
         let table = "1 language_server --csrf_token abc"
         XCTAssertNil(AntigravityBridge.discover(processTable: table, listeningPorts: { _ in [] }))
+    }
+
+    // MARK: - A bridge somewhere else
+
+    /// A local endpoint is still two loopback ports and a token — the shape
+    /// discovery has always produced.
+    func testALocalEndpointDialsLoopbackOverHTTPS() {
+        let endpoint = AntigravityBridge.Endpoint(ports: [63881, 63882], csrfToken: "t")
+        XCTAssertEqual(endpoint.baseURLs.map(\.absoluteString),
+                       ["https://127.0.0.1:63881", "https://127.0.0.1:63882"])
+        XCTAssertEqual(endpoint.ports, [63881, 63882])
+        XCTAssertEqual(endpoint.csrfToken, "t")
+    }
+
+    /// A relay in front of an `agy` on another machine: one fixed address, no
+    /// token, because the CLI's server demands none and the relay adds none.
+    func testARemoteEndpointIsOneAddressAndNoToken() {
+        let endpoint = AntigravityBridge.Endpoint(remote: URL(string: "http://100.77.193.57:7910")!)
+        XCTAssertEqual(endpoint.baseURLs.map(\.absoluteString), ["http://100.77.193.57:7910"])
+        XCTAssertEqual(endpoint.ports, [7910])
+        XCTAssertNil(endpoint.csrfToken)
+    }
+
+    func testTheEnvironmentNamesTheRemoteFirst() {
+        let defaults = UserDefaults(suiteName: "AntigravityBridgeTests.\(UUID())")!
+        defaults.set("http://from-defaults:1", forKey: "antigravityBridgeURL")
+        XCTAssertEqual(
+            AntigravityBridge.configuredRemote(environment: ["CODENOTCH_ANTIGRAVITY_URL": "http://from-env:2"],
+                                               defaults: defaults)?.absoluteString,
+            "http://from-env:2")
+        XCTAssertEqual(
+            AntigravityBridge.configuredRemote(environment: [:], defaults: defaults)?.absoluteString,
+            "http://from-defaults:1")
+    }
+
+    /// Nothing configured is the ordinary case, and must read as "discover
+    /// locally", not as a broken address.
+    func testNothingConfiguredMeansNoRemote() {
+        let defaults = UserDefaults(suiteName: "AntigravityBridgeTests.\(UUID())")!
+        XCTAssertNil(AntigravityBridge.configuredRemote(environment: [:], defaults: defaults))
+        defaults.set("   ", forKey: "antigravityBridgeURL")
+        XCTAssertNil(AntigravityBridge.configuredRemote(environment: [:], defaults: defaults))
+    }
+
+    /// Only a web address counts. Anything else would be dialled as-is and
+    /// fail in a way that reads as Antigravity being closed.
+    func testANonWebAddressIsIgnored() {
+        XCTAssertNil(AntigravityBridge.configuredRemote(environment: ["CODENOTCH_ANTIGRAVITY_URL": "not a url"],
+                                                        defaults: UserDefaults(suiteName: "x.\(UUID())")!))
+        XCTAssertNil(AntigravityBridge.configuredRemote(environment: ["CODENOTCH_ANTIGRAVITY_URL": "file:///tmp/x"],
+                                                        defaults: UserDefaults(suiteName: "x.\(UUID())")!))
+        XCTAssertNil(AntigravityBridge.configuredRemote(environment: ["CODENOTCH_ANTIGRAVITY_URL": "http://"],
+                                                        defaults: UserDefaults(suiteName: "x.\(UUID())")!))
     }
 
     func testItParsesPortsFromLSOF() {
