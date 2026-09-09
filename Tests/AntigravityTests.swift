@@ -1105,3 +1105,91 @@ final class KeychainDuplicateTests: XCTestCase {
         XCTAssertEqual(winner?.persistentRef, Data("usable".utf8))
     }
 }
+
+/// A relay stands in front of an `agy` on another machine, and that `agy` holds
+/// its own credential. So the token in *this* Mac's keychain says nothing about
+/// whether the relay can answer — and must not be allowed to stand in front of
+/// it. It did: an expired token froze the ring for a day while the relay was
+/// serving fresh numbers the whole time.
+final class AntigravityRelayTests: XCTestCase {
+    override func tearDown() {
+        RelayStub.reset(relayHost: nil)
+        super.tearDown()
+    }
+
+    func testAConfiguredRelayIsAskedBeforeTheLocalCredential() async throws {
+        RelayStub.reset(relayHost: "relay.test")
+        let provider = AntigravityProvider(
+            session: RelayStub.session(),
+            remote: URL(string: "https://relay.test:7910")!,
+            localSession: RelayStub.session()
+        )
+
+        let snapshot = try await provider.fetchSnapshot()
+
+        XCTAssertEqual(snapshot.fidelity, .official)
+        XCTAssertEqual(snapshot.headlineID, "gemini-weekly")
+        XCTAssertEqual(snapshot.windows.count, 1)
+        XCTAssertEqual(snapshot.windows.first?.id, "gemini-weekly")
+        XCTAssertEqual(snapshot.windows.first?.usedFraction ?? 0, 0.25, accuracy: 0.0001)
+        // The whole point: Google is never dialled, so nothing on the way there
+        // — a stale token above all — can decide the ring.
+        XCTAssertEqual(RelayStub.otherRequests, 0,
+                       "the relay answered, so Google must not have been asked")
+    }
+}
+
+/// Answers the relay with the bare envelope a real `agy` sends, and counts
+/// every request that went anywhere else.
+private final class RelayStub: URLProtocol {
+    private static let lock = NSLock()
+    private static var relayHost: String?
+    private static var strayRequests = 0
+
+    /// The same body as `testItReadsTheBareEnvelopeGoogleAnswersWith`.
+    private static let quota = Data("""
+    {"groups":[{"displayName":"Gemini Models","buckets":[
+      {"bucketId":"gemini-weekly","displayName":"Weekly Limit Remaining",
+       "window":"weekly","remainingFraction":0.75,"resetTime":"2026-09-01T00:00:00Z"}]}]}
+    """.utf8)
+
+    static func reset(relayHost: String?) {
+        lock.lock(); self.relayHost = relayHost; strayRequests = 0; lock.unlock()
+    }
+
+    static var otherRequests: Int {
+        lock.lock(); defer { lock.unlock() }
+        return strayRequests
+    }
+
+    static func session() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RelayStub.self]
+        return URLSession(configuration: configuration)
+    }
+
+    private static func isRelay(_ request: URLRequest) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard let host = relayHost, request.url?.host == host else {
+            strayRequests += 1
+            return false
+        }
+        return true
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let relay = Self.isRelay(request)
+        let response = HTTPURLResponse(url: request.url!,
+                                       statusCode: relay ? 200 : 500,
+                                       httpVersion: "HTTP/1.1",
+                                       headerFields: ["Content-Type": "application/json"])!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: relay ? Self.quota : Data())
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}

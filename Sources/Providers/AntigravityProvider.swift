@@ -47,15 +47,23 @@ actor AntigravityProvider: UsageProvider {
     private var everBridged = false
 
     init(session: URLSession = .shared,
-         remote: URL? = AntigravityBridge.configuredRemote()) {
+         remote: URL? = AntigravityBridge.configuredRemote(),
+         localSession: URLSession = AntigravityProvider.bridgeSession()) {
         self.session = session
-        // The same session serves a remote bridge: `LocalhostTrust` only
-        // vouches for loopback, so a remote HTTPS address is held to the
-        // system's trust and a plain HTTP one never asks.
-        self.localSession = URLSession(configuration: .ephemeral,
-                                       delegate: LocalhostTrust(),
-                                       delegateQueue: nil)
+        self.localSession = localSession
         self.remote = remote.map { AntigravityBridge.Endpoint(remote: $0) }
+    }
+
+    /// The session the bridge is asked over — a parameter only so a test can
+    /// answer for a relay; nothing in the app passes anything but this.
+    ///
+    /// The same session serves a remote bridge: `LocalhostTrust` only vouches
+    /// for loopback, so a remote HTTPS address is held to the system's trust
+    /// and a plain HTTP one never asks.
+    static func bridgeSession() -> URLSession {
+        URLSession(configuration: .ephemeral,
+                   delegate: LocalhostTrust(),
+                   delegateQueue: nil)
     }
 
     nonisolated var signInRoute: SignInRoute {
@@ -75,6 +83,18 @@ actor AntigravityProvider: UsageProvider {
     }
 
     func fetchSnapshot() async throws -> ProviderSnapshot {
+        // A configured relay is asked before anything else, credential
+        // included. The `agy` behind it holds its own token, so ours says
+        // nothing about whether it can answer — and a check in front of it
+        // only ever subtracts: an expired token in this Mac's keychain froze
+        // the ring for a day while the relay served fresh numbers throughout.
+        if let windows = await remoteQuota(), !windows.isEmpty {
+            everBridged = true
+            return ProviderSnapshot(id: id, displayName: displayName, glyph: glyph,
+                                    fidelity: .official, status: .ok, windows: windows,
+                                    headlineID: "gemini-weekly")
+        }
+
         let credentials = try AntigravityCredentials.load()
         // Expired is not signed out: Antigravity refreshes this on its own the
         // next time it runs, and the last reading is still true, just old.
@@ -160,19 +180,24 @@ actor AntigravityProvider: UsageProvider {
         )
     }
 
+    /// Ask the relay the user pointed at, if there is one.
+    ///
+    /// Nil covers both "none configured" and "not answering"; either way the
+    /// caller goes on to the flow that does not need it.
+    private func remoteQuota() async -> [LimitWindow]? {
+        guard let remote else { return nil }
+        return try? await AntigravityBridge.quota(from: remote, session: localSession)
+    }
+
     /// Ask Antigravity's language server, if it is running.
     ///
     /// Returns nil rather than throwing when it is not: Antigravity being
     /// closed is the ordinary case, not a fault, and the caller has an honest
     /// answer to fall back to.
     private func localQuota() async -> [LimitWindow]? {
-        if let remote, let windows = try? await AntigravityBridge.quota(
-            from: remote, session: localSession
-        ), !windows.isEmpty {
-            return windows
-        }
-        // A relay that is down is not a reason to ignore an Antigravity
-        // running right here.
+        // The relay was already asked, at the top of `fetchSnapshot`. A relay
+        // that is down is not a reason to ignore an Antigravity running right
+        // here.
         if let bridge, let windows = try? await AntigravityBridge.quota(
             from: bridge, session: localSession
         ), !windows.isEmpty {
