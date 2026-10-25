@@ -64,3 +64,14 @@ Include the unified log around the time it happened:
 ```sh
 /usr/bin/log show --last 10m --predicate 'subsystem == "com.vinz.codenotch"' --info --debug
 ```
+
+## Heesoo's fork (branch `sooth`)
+
+The fork is installed in `/Applications` on Heesoo's own Mac and signed with his Apple Development identity, so keychain grants survive rebuilds. Two targets, run from the Mac checkout (`~/01 Projects/codenotch`):
+
+```
+make sooth-release   # Release build, signed; needs the login keychain unlocked in this shell
+make sooth-install   # copy into /Applications and relaunch
+```
+
+The Makefile's "Sooth fork" section says why each override exists.
