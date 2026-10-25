@@ -159,3 +159,46 @@ verify-release:
 	codesign --verify --deep --strict --verbose=2 $(RELEASE_DIR)/mnt/$(APP_NAME).app
 	spctl --assess --type execute --verbose=4 $(RELEASE_DIR)/mnt/$(APP_NAME).app
 	hdiutil detach $(RELEASE_DIR)/mnt
+
+# --- Sooth fork ---------------------------------------------------------------
+# Heesoo's fork runs from /Applications on his own Mac, so the keychain grants
+# Codenotch reads with have to outlive every rebuild. That takes a signature
+# with a stable designated requirement; ad-hoc gives `cdhash H"..."`, which
+# changes per build and never matches a grant again. His Apple Development
+# identity gives `identifier + anchor apple generic + leaf CN`, fixed across
+# builds, and a TeamIdentifier, so cron-codenotch-sync.sh's partition entry is
+# a constant `teamid:` instead of a rotating cdhash. Over ssh the key signs
+# only after `security unlock-keychain -p <login password> login.keychain`
+# (the key's partition list already lists codesign:).
+#
+# The other overrides fix what the generated project leaves wrong for a plain
+# Release build: PRODUCT_NAME is empty (the app builds as `.app`), there is no
+# LC_RPATH (Sparkle does not load), and the hardened runtime has nothing to
+# protect in a local build.
+SOOTH_SIGN_IDENTITY ?= Apple Development: Heesoo Jung (UBJU58K8KS)
+SOOTH_SIGN_TEAM     ?= 62B9JKDUDX
+SOOTH_DD            := build/dd
+SOOTH_APP           := $(SOOTH_DD)/Build/Products/Release/$(APP_NAME).app
+
+.PHONY: sooth-release sooth-install
+
+sooth-release: gen
+	xcodebuild -project $(PROJECT) -scheme $(SCHEME) -destination '$(DEST)' \
+		-derivedDataPath "$(SOOTH_DD)" -configuration Release \
+		"CODE_SIGN_IDENTITY=$(SOOTH_SIGN_IDENTITY)" DEVELOPMENT_TEAM=$(SOOTH_SIGN_TEAM) \
+		CODE_SIGN_STYLE=Manual "PROVISIONING_PROFILE_SPECIFIER=" \
+		"OTHER_CODE_SIGN_FLAGS=--timestamp=none" \
+		'PRODUCT_NAME=$$(TARGET_NAME)' 'PRODUCT_MODULE_NAME=$$(TARGET_NAME)' \
+		'LD_RUNPATH_SEARCH_PATHS=@executable_path/../Frameworks' \
+		ENABLE_HARDENED_RUNTIME=NO build
+	codesign -d -r- "$(SOOTH_APP)" 2>&1 | grep -q 'certificate leaf' \
+		|| { echo "sooth-release: not signed with a stable identity" >&2; exit 1; }
+
+# Replaces /Applications/Codenotch.app and relaunches. The first signed install
+# after an ad-hoc one still needs `cron-codenotch-sync.sh --force` from the VPS
+# between the copy and the launch (the old ACL rows pin a dead cdhash); later
+# rebuilds keep the same requirement, so the grants simply carry over.
+sooth-install: sooth-release
+	pkill -x $(APP_NAME) || true
+	rm -rf /Applications/$(APP_NAME).app
+	ditto "$(SOOTH_APP)" /Applications/$(APP_NAME).app
